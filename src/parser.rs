@@ -21,6 +21,7 @@ pub fn parse_line(line: &str) -> Option<MessageRecord> {
     let cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("unknown").to_string();
     let timestamp_str = v.get("timestamp")?.as_str()?;
     let timestamp: DateTime<Utc> = timestamp_str.parse().ok()?;
+    let git_branch = v.get("gitBranch").and_then(|b| b.as_str()).unwrap_or("").to_string();
 
     let message = v.get("message")?;
     let model = message
@@ -28,6 +29,17 @@ pub fn parse_line(line: &str) -> Option<MessageRecord> {
         .and_then(|m| m.as_str())
         .unwrap_or("unknown")
         .to_string();
+
+    let tool_names: Vec<String> = message
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                .filter_map(|item| item.get("name").and_then(|n| n.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let usage = message.get("usage")?;
 
@@ -57,22 +69,14 @@ pub fn parse_line(line: &str) -> Option<MessageRecord> {
         output_tokens,
         cache_creation_tokens,
         cache_read_tokens,
+        tool_names,
+        git_branch,
     })
 }
 
 /// Parse all lines from a buffer, returning only valid MessageRecords.
 pub fn parse_buffer(buf: &str) -> Vec<MessageRecord> {
     buf.lines().filter_map(parse_line).collect()
-}
-
-/// Decode a Claude Code project directory name to a human-readable path.
-/// e.g. "-home-bbeierle12-Agent-Shell" -> "/home/bbeierle12/Agent-Shell"
-pub fn decode_project_dir(dir_name: &str) -> String {
-    if dir_name.starts_with('-') {
-        dir_name.replacen('-', "/", 1).replace('-', "/")
-    } else {
-        dir_name.replace('-', "/")
-    }
 }
 
 /// Extract a short project name from a cwd path.
@@ -96,14 +100,6 @@ pub fn short_project_name(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_decode_project_dir() {
-        assert_eq!(
-            decode_project_dir("-home-bbeierle12-Agent-Shell"),
-            "/home/bbeierle12/Agent/Shell"
-        );
-    }
 
     #[test]
     fn test_short_project_name() {
@@ -131,5 +127,100 @@ mod tests {
         assert_eq!(rec.output_tokens, 200);
         assert_eq!(rec.cache_creation_tokens, 50);
         assert_eq!(rec.cache_read_tokens, 1000);
+    }
+
+    #[test]
+    fn test_parse_line_empty_string() {
+        assert!(parse_line("").is_none());
+    }
+
+    #[test]
+    fn test_parse_line_whitespace_only() {
+        assert!(parse_line("   \n").is_none());
+    }
+
+    #[test]
+    fn test_parse_line_invalid_json() {
+        assert!(parse_line("{not json}").is_none());
+    }
+
+    #[test]
+    fn test_parse_line_missing_usage() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[]}}"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_line_missing_session_id() {
+        let line = r#"{"type":"assistant","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_line_missing_timestamp() {
+        let line = r#"{"type":"assistant","sessionId":"abc","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        assert!(parse_line(line).is_none());
+    }
+
+    #[test]
+    fn test_parse_line_zero_tokens() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert_eq!(rec.input_tokens, 0);
+        assert_eq!(rec.output_tokens, 0);
+        assert_eq!(rec.cache_creation_tokens, 0);
+        assert_eq!(rec.cache_read_tokens, 0);
+    }
+
+    #[test]
+    fn test_parse_line_extracts_tool_names() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{}},{"type":"text","text":"hello"},{"type":"tool_use","name":"Read","id":"t2","input":{}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert_eq!(rec.tool_names, vec!["Bash", "Read"]);
+    }
+
+    #[test]
+    fn test_parse_line_no_tool_use_empty_vec() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert!(rec.tool_names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_empty_content_array() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert!(rec.tool_names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_line_extracts_git_branch() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","gitBranch":"feature/auth","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert_eq!(rec.git_branch, "feature/auth");
+    }
+
+    #[test]
+    fn test_parse_line_missing_git_branch_defaults_empty() {
+        let line = r#"{"type":"assistant","sessionId":"abc","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert_eq!(rec.git_branch, "");
+    }
+
+    #[test]
+    fn test_parse_buffer_mixed() {
+        let buf = [
+            "",                               // blank
+            r#"{"type":"user","sessionId":"a","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"role":"user","content":"hi"}}"#, // user msg
+            "{bad json}",                     // invalid
+            r#"{"type":"assistant","sessionId":"a","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","content":[],"usage":{"input_tokens":10,"output_tokens":20}}}"#, // valid
+            "   ",                            // whitespace
+            r#"{"type":"assistant","sessionId":"b","timestamp":"2026-03-03T11:00:00Z","cwd":"/tmp","message":{"model":"opus","role":"assistant","content":[],"usage":{"input_tokens":30,"output_tokens":40}}}"#, // valid
+        ].join("\n");
+
+        let recs = parse_buffer(&buf);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].session_id, "a");
+        assert_eq!(recs[1].session_id, "b");
     }
 }

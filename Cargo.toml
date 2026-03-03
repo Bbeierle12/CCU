@@ -5,9 +5,12 @@ edition = "2021"
 description = "Desktop widget showing Claude Code usage metrics in real-time"
 
 [dependencies]
-eframe = "0.31"
-notify = "7.0"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
-dirs = "6"
+eframe = "0.31.1"
+notify = "7.0.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+chrono = { version = "0.4.40", features = ["serde"] }
+dirs = "6.0.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify-rust = "4.12.0"
+tray-icon = "0.21"

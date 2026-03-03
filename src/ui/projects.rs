@@ -1,8 +1,11 @@
 use eframe::egui;
 
-use crate::types::MetricsState;
+use crate::types::{format_tokens, MetricsState};
+use crate::HistoricalData;
 
-pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
+use super::sparkline;
+
+pub fn render(ui: &mut egui::Ui, state: &MetricsState, historical: &Option<HistoricalData>) {
     let projects = state.projects_sorted();
 
     if projects.is_empty() {
@@ -13,8 +16,12 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
     ui.add_space(4.0);
 
     let max_tokens = projects.first().map(|p| p.total_tokens()).unwrap_or(1).max(1);
+    let has_trends = historical
+        .as_ref()
+        .is_some_and(|h| !h.project_trends.is_empty());
 
     egui::ScrollArea::vertical()
+        .id_salt("projects_scroll")
         .max_height(160.0)
         .show(ui, |ui| {
             for p in &projects {
@@ -29,7 +36,7 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
 
                     // Bar
                     let frac = p.total_tokens() as f32 / max_tokens as f32;
-                    let bar_width = 150.0;
+                    let bar_width = if has_trends { 100.0 } else { 150.0 };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(bar_width, 14.0), egui::Sense::hover());
 
@@ -53,17 +60,14 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
 
                     // Token count label
                     ui.label(format_tokens(p.total_tokens()));
+
+                    // Trend sparkline (if historical data available)
+                    if let Some(hist) = historical {
+                        if let Some(trend) = hist.project_trends.get(&p.name) {
+                            sparkline::draw_project_trend(ui, trend);
+                        }
+                    }
                 });
             }
         });
-}
-
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
 }

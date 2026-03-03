@@ -1,12 +1,13 @@
 use chrono::Utc;
 use eframe::egui;
 
-use crate::config;
-use crate::types::MetricsState;
+use crate::alerts;
+use crate::settings::Settings;
+use crate::types::{format_tokens, MetricsState};
 
-pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
+pub fn render(ui: &mut egui::Ui, state: &MetricsState, settings: &Settings) {
     let now = Utc::now();
-    let active = state.active_session_count();
+    let active = state.active_session_count(settings);
 
     // Header
     ui.horizontal(|ui| {
@@ -48,10 +49,8 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
         });
         cols[3].vertical_centered(|ui| {
             ui.strong("Est. Cost");
-            ui.colored_label(
-                egui::Color32::from_rgb(255, 180, 50),
-                format!("${:.2}", state.estimated_cost()),
-            );
+            let cost = state.estimated_cost(settings);
+            ui.colored_label(alerts::cost_color(cost, settings), format!("${:.2}", cost));
         });
     });
 
@@ -61,8 +60,9 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
     if !state.models.is_empty() {
         ui.horizontal_wrapped(|ui| {
             ui.label("Models:");
-            for (name, m) in &state.models {
-                let cost = config::estimate_cost(
+            let model_count = state.models.len();
+            for (i, (name, m)) in state.models.iter().enumerate() {
+                let cost = settings.estimate_cost(
                     name,
                     m.input_tokens,
                     m.output_tokens,
@@ -79,20 +79,34 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState) {
                         cost
                     ),
                 );
-                ui.label(" | ");
+                if i < model_count - 1 {
+                    ui.label(" | ");
+                }
             }
         });
         ui.separator();
     }
-}
 
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+    // Burn rate indicator
+    let burn_rate = state.burn_rate_per_minute(settings);
+    if burn_rate > 0.0 {
+        ui.horizontal(|ui| {
+            ui.label("Burn Rate:");
+            let color = if burn_rate < settings.burn_rate_low {
+                egui::Color32::from_rgb(0, 200, 80) // green
+            } else if burn_rate < settings.burn_rate_high {
+                egui::Color32::from_rgb(255, 200, 50) // yellow
+            } else {
+                egui::Color32::from_rgb(255, 80, 60) // red
+            };
+            let label = if burn_rate >= 1000.0 {
+                format!("{:.1}K tok/min", burn_rate / 1000.0)
+            } else {
+                format!("{:.0} tok/min", burn_rate)
+            };
+            ui.colored_label(color, label);
+        });
+        ui.separator();
     }
 }
 
