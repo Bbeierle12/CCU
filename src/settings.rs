@@ -140,25 +140,43 @@ impl Settings {
                 .push("Burn rate window must be >= 1 minute".to_string());
         }
 
-        // Pricing must be non-negative
+        // Pricing must be non-negative and finite.
+        // NaN bypasses `< 0.0` checks, so we check `is_finite()` first.
         for (name, p) in [
             ("Opus", &self.opus_pricing),
             ("Sonnet", &self.sonnet_pricing),
             ("Haiku", &self.haiku_pricing),
         ] {
-            if p.input_per_m < 0.0
-                || p.output_per_m < 0.0
-                || p.cache_write_per_m < 0.0
-                || p.cache_read_per_m < 0.0
-            {
+            let vals = [
+                p.input_per_m,
+                p.output_per_m,
+                p.cache_write_per_m,
+                p.cache_read_per_m,
+            ];
+            if vals.iter().any(|v| !v.is_finite()) {
+                errors
+                    .errors
+                    .push(format!("{} pricing values must be finite numbers", name));
+            } else if vals.iter().any(|v| *v < 0.0) {
                 errors
                     .errors
                     .push(format!("{} pricing values must be >= 0", name));
             }
         }
 
-        // Window size minimums
-        if self.window_width < 200.0 || self.window_height < 200.0 {
+        // Alert/burn thresholds must also be finite
+        if !self.daily_cost_warn.is_finite()
+            || !self.daily_cost_critical.is_finite()
+            || !self.burn_rate_low.is_finite()
+            || !self.burn_rate_high.is_finite()
+        {
+            errors
+                .errors
+                .push("Threshold values must be finite numbers".to_string());
+        }
+
+        // Window size minimums (also catches NaN since NaN < 200.0 is false)
+        if !(self.window_width >= 200.0) || !(self.window_height >= 200.0) {
             errors
                 .errors
                 .push("Window size must be at least 200x200".to_string());
@@ -278,5 +296,62 @@ mod tests {
         // When file doesn't exist, should return defaults
         let s = Settings::load();
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn validate_nan_pricing_caught() {
+        let mut s = Settings::default();
+        s.opus_pricing.input_per_m = f64::NAN;
+        let errs = s.validate();
+        assert!(!errs.is_empty(), "NaN pricing should be caught by validation");
+    }
+
+    #[test]
+    fn validate_infinity_pricing_caught() {
+        let mut s = Settings::default();
+        s.sonnet_pricing.output_per_m = f64::INFINITY;
+        let errs = s.validate();
+        assert!(!errs.is_empty(), "Infinity pricing should be caught");
+    }
+
+    #[test]
+    fn validate_nan_threshold_caught() {
+        let mut s = Settings::default();
+        s.daily_cost_warn = f64::NAN;
+        let errs = s.validate();
+        assert!(!errs.is_empty(), "NaN threshold should be caught");
+    }
+
+    #[test]
+    fn validate_nan_window_size_caught() {
+        let mut s = Settings::default();
+        s.window_width = f64::NAN as f32;
+        let errs = s.validate();
+        assert!(!errs.is_empty(), "NaN window size should be caught");
+    }
+
+    #[test]
+    fn validate_equal_warn_critical() {
+        let mut s = Settings::default();
+        s.daily_cost_warn = 25.0;
+        s.daily_cost_critical = 25.0;
+        assert!(!s.validate().is_empty(), "equal warn/critical should fail");
+    }
+
+    #[test]
+    fn validate_zero_burn_window() {
+        let mut s = Settings::default();
+        s.burn_rate_window_minutes = 0;
+        assert!(!s.validate().is_empty());
+    }
+
+    #[test]
+    fn partial_json_uses_defaults_for_missing_fields() {
+        let json = r#"{"daily_cost_warn": 50.0}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!((s.daily_cost_warn - 50.0).abs() < 0.001);
+        // Other fields should be at defaults
+        assert!((s.daily_cost_critical - 25.0).abs() < 0.001);
+        assert_eq!(s.opus_pricing, Settings::default().opus_pricing);
     }
 }

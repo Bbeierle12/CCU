@@ -136,6 +136,16 @@ impl MetricsState {
                         }
                     }
 
+                    // Cap pending_tool_uses to prevent unbounded growth from
+                    // unmatched tool_use blocks (interrupted sessions, partial logs).
+                    // Evict oldest entries when over the limit.
+                    const MAX_PENDING: usize = 1000;
+                    if self.pending_tool_uses.len() > MAX_PENDING {
+                        let cutoff = rec.timestamp - Duration::minutes(30);
+                        self.pending_tool_uses
+                            .retain(|_, p| p.timestamp > cutoff);
+                    }
+
                     // Per-branch (token accounting)
                     if !rec.git_branch.is_empty() {
                         let branch = self
@@ -188,8 +198,9 @@ impl MetricsState {
                     // Correlate with pending tool_use for latency
                     for tool_use_id in &rec.tool_use_ids {
                         if let Some(pending) = self.pending_tool_uses.remove(tool_use_id) {
+                            // Clamp to 0 to handle clock skew / out-of-order records
                             let latency_ms =
-                                (rec.timestamp - pending.timestamp).num_milliseconds();
+                                (rec.timestamp - pending.timestamp).num_milliseconds().max(0);
                             self.tool_latencies
                                 .entry(pending.tool_name)
                                 .or_default()
@@ -1159,5 +1170,106 @@ mod tests {
         ], 0);
 
         assert!(state.tool_latencies.is_empty());
+    }
+
+    #[test]
+    fn test_duplicate_tool_use_id_overwrites_pending() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+
+        // Two assistant messages with the same tool_use_id "t1" — second should overwrite
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec!["Bash"], vec!["t1"], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now + chrono::Duration::seconds(5), vec!["Read"], vec!["t1"], None),
+        ], 0);
+
+        // Only one pending entry for "t1" — the second (Read)
+        assert_eq!(state.pending_tool_uses.len(), 1);
+        assert_eq!(state.pending_tool_uses["t1"].tool_name, "Read");
+    }
+
+    #[test]
+    fn test_negative_latency_from_clock_skew() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        // Tool result arrives BEFORE the tool_use (clock skew)
+        let earlier = now - chrono::Duration::milliseconds(500);
+
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec!["Bash"], vec!["t1"], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, earlier, vec![], vec!["t1"], Some(false)),
+        ], 0);
+
+        // Should still record (negative latency is clamped to 0)
+        let stats = &state.tool_latencies["Bash"];
+        assert_eq!(stats.call_count, 1);
+        assert!(stats.total_ms >= 0, "negative latency should be clamped to 0");
+    }
+
+    #[test]
+    fn test_effective_burn_rate_with_idle_gap() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+
+        // 5000 tokens at t=0, 5000 tokens at t=2min (active), then 5000 at t=12min (idle gap)
+        state.burn_window.push_back((now - chrono::Duration::minutes(12), 5000));
+        state.burn_window.push_back((now - chrono::Duration::minutes(10), 5000));
+        state.burn_window.push_back((now, 5000));
+
+        let settings = Settings::default(); // idle_gap_minutes=5
+        let eff = state.effective_burn_rate(&settings);
+        // Active time = 2 minutes (first gap of 2min is ≤ 5min threshold)
+        // 10-minute gap between entry 2 and 3 is excluded (> 5min)
+        // So effective = 15000 / 2 = 7500 tok/min
+        assert!(eff > state.burn_rate_per_minute(&settings));
+    }
+
+    #[test]
+    fn test_prune_burn_window() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+
+        state.burn_window.push_back((now - chrono::Duration::minutes(20), 100));
+        state.burn_window.push_back((now - chrono::Duration::minutes(5), 200));
+        state.burn_window.push_back((now, 300));
+
+        state.prune_burn_window(10); // 10-minute window
+        assert_eq!(state.burn_window.len(), 2); // 20min-ago entry pruned
+        assert_eq!(state.burn_window[0].1, 200);
+    }
+
+    #[test]
+    fn test_ingest_assistant_text_stats() {
+        let mut state = MetricsState::default();
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        let rec = MessageRecord {
+            session_id: "s1".to_string(),
+            timestamp: Utc::now(),
+            cwd: format!("{}/test-project", home),
+            model: "sonnet".to_string(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            tool_names: vec![],
+            git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 150,
+            text_word_count: 30,
+            tool_use_ids: vec![],
+            is_tool_error: None,
+        };
+        state.ingest(&[rec], 0);
+
+        let s = &state.sessions["s1"];
+        assert_eq!(s.assistant_text_length, 150);
+        assert_eq!(s.assistant_word_count, 30);
+        assert!((s.avg_response_words() - 30.0).abs() < 0.001);
     }
 }

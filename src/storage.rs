@@ -112,7 +112,12 @@ impl Storage {
     }
 
     /// Upsert a batch of records into daily_metrics (grouped by date+project+model).
+    /// Only assistant records contribute meaningful token/model data; user prompts and
+    /// tool results are skipped to avoid polluting the daily_metrics table with
+    /// empty-model rows.
     pub fn upsert_daily(&self, records: &[MessageRecord]) -> rusqlite::Result<()> {
+        use crate::types::MessageType;
+
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -128,6 +133,11 @@ impl Storage {
             )?;
 
             for rec in records {
+                // Skip non-assistant records — they have model="" and tokens=0,
+                // which would create spurious (date, project, "") rows.
+                if rec.message_type != MessageType::Assistant {
+                    continue;
+                }
                 let date = rec.timestamp.format("%Y-%m-%d").to_string();
                 let project = parser::short_project_name(&rec.cwd);
                 let tool_json = if rec.tool_names.is_empty() {
@@ -697,5 +707,81 @@ mod tests {
 
         let state = storage.load_date("2026-03-01").unwrap().unwrap();
         assert_eq!(state.sessions["s1"].branch, "feature/new");
+    }
+
+    // ── Bug regression: empty model from user/tool_result records ──
+
+    #[test]
+    fn test_upsert_sessions_empty_model_does_not_corrupt() {
+        let storage = Storage::open_memory().unwrap();
+
+        // First: assistant record sets the model to "sonnet"
+        let rec1 = make_record_on_date("s1", "sonnet", 100, 200, "2026-03-01");
+        storage.upsert_sessions(&[rec1]).unwrap();
+
+        // Second: user prompt or tool_result has model="" and tokens=0
+        let mut rec2 = make_record_on_date("s1", "", 0, 0, "2026-03-01");
+        rec2.message_type = MessageType::UserPrompt;
+        storage.upsert_sessions(&[rec2]).unwrap();
+
+        let state = storage.load_date("2026-03-01").unwrap().unwrap();
+        // Model should still be "sonnet", not overwritten to ""
+        assert_eq!(state.sessions["s1"].model, "sonnet");
+    }
+
+    #[test]
+    fn test_upsert_daily_skips_non_assistant_records() {
+        let storage = Storage::open_memory().unwrap();
+
+        // Assistant record with "sonnet"
+        let rec1 = make_record_on_date("s1", "sonnet", 100, 200, "2026-03-01");
+        storage.upsert_daily(&[rec1]).unwrap();
+
+        // User prompt with model="" — should be skipped, not create a spurious row
+        let mut rec2 = make_record_on_date("s1", "", 0, 0, "2026-03-01");
+        rec2.message_type = MessageType::UserPrompt;
+        storage.upsert_daily(&[rec2]).unwrap();
+
+        let rows = storage
+            .query_daily_range("2026-03-01", "2026-03-01")
+            .unwrap();
+        // Only one row for "sonnet" — the user prompt was filtered out
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "sonnet");
+        assert_eq!(rows[0].input_tokens, 100);
+    }
+
+    // ── Helper function coverage ──
+
+    #[test]
+    fn test_today_str_format() {
+        let today = today_str();
+        // Should match YYYY-MM-DD format
+        assert_eq!(today.len(), 10);
+        assert_eq!(&today[4..5], "-");
+        assert_eq!(&today[7..8], "-");
+    }
+
+    #[test]
+    fn test_days_ago_format_and_ordering() {
+        let today = today_str();
+        let week_ago = days_ago(7);
+        assert!(week_ago < today);
+        assert_eq!(week_ago.len(), 10);
+    }
+
+    #[test]
+    fn test_parse_date_valid() {
+        let d = parse_date("2026-03-04");
+        assert!(d.is_some());
+        let d = d.unwrap();
+        assert_eq!(d.to_string(), "2026-03-04");
+    }
+
+    #[test]
+    fn test_parse_date_invalid() {
+        assert!(parse_date("not-a-date").is_none());
+        assert!(parse_date("2026/03/04").is_none());
+        assert!(parse_date("").is_none());
     }
 }

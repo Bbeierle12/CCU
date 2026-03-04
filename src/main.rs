@@ -50,54 +50,45 @@ fn main() -> eframe::Result<()> {
     };
     let db = Arc::new(Mutex::new(db));
 
-    // Backfill: always persist all JSONL data to SQLite on startup.
-    // This is fast (upsert is idempotent) and ensures historical data is available.
-    // With --backfill flag, run backfill only and exit.
+    // Single JSONL scan: backfill SQLite AND build today's live state in one pass.
+    // Previously this was two separate full scans; now the backfill scan results
+    // feed directly into MetricsState, halving startup I/O.
+    let state = Arc::new(Mutex::new(MetricsState::default()));
+    let mut tracker = watcher::FileTracker::new();
     {
-        println!("Backfilling database from JSONL files...");
-        let mut bf_tracker = watcher::FileTracker::new();
-        let scan_results = watcher::initial_scan(&projects_dir, &mut bf_tracker);
+        println!("Scanning JSONL files...");
+        let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
         let db_lock = db.lock().expect("db mutex poisoned");
+        let mut s = state.lock().expect("metrics state mutex poisoned");
         let mut total_records = 0u64;
         for (_path, records) in &scan_results {
             if !records.is_empty() {
+                // Persist all records to SQLite (historical data for sparklines)
                 if let Err(e) = db_lock.persist(records) {
                     eprintln!("  Error persisting records: {}", e);
                 }
+                // Build today's live state (ingest filters to today-only internally)
+                s.ingest(records, settings.idle_gap_minutes);
                 total_records += records.len() as u64;
             }
         }
         if let Ok(Some((min, max))) = db_lock.date_range() {
             println!(
-                "Backfill complete: {} records, date range {} to {}",
+                "Scan complete: {} records, date range {} to {}",
                 total_records, min, max
             );
         } else {
-            println!("Backfill complete: {} records", total_records);
-        }
-        if backfill {
-            std::process::exit(0);
-        }
-    }
-
-    // Shared state between watcher thread and UI
-    let state = Arc::new(Mutex::new(MetricsState::default()));
-
-    // Always build today's live state from JSONL scan (authoritative source).
-    // The DB backfill above handles historical data for sparklines.
-    let mut tracker = watcher::FileTracker::new();
-    {
-        let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
-        let mut s = state.lock().expect("metrics state mutex poisoned");
-        for (_path, records) in &scan_results {
-            s.ingest(records, settings.idle_gap_minutes);
+            println!("Scan complete: {} records", total_records);
         }
         println!(
-            "Initial scan: {} sessions, {} messages, ${:.2} estimated",
+            "Live state: {} sessions, {} messages, ${:.2} estimated",
             s.sessions.len(),
             s.total_messages,
             s.estimated_cost(&settings)
         );
+        if backfill {
+            std::process::exit(0);
+        }
     }
 
     // Channel for new records from the file watcher
@@ -327,5 +318,42 @@ impl eframe::App for UsageApp {
             self.prev_date_range = self.date_range_selection;
             self.refresh_historical();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_date_range_selection_labels() {
+        assert_eq!(DateRangeSelection::Today.label(), "Today");
+        assert_eq!(DateRangeSelection::Last7.label(), "Last 7 Days");
+        assert_eq!(DateRangeSelection::Last30.label(), "Last 30 Days");
+        assert_eq!(DateRangeSelection::AllTime.label(), "All Time");
+    }
+
+    #[test]
+    fn test_date_range_today_start_equals_end() {
+        let (start, end) = DateRangeSelection::Today.date_range();
+        assert_eq!(start, end);
+    }
+
+    #[test]
+    fn test_date_range_last7_start_before_end() {
+        let (start, end) = DateRangeSelection::Last7.date_range();
+        assert!(start < end);
+    }
+
+    #[test]
+    fn test_date_range_last30_start_before_end() {
+        let (start, end) = DateRangeSelection::Last30.date_range();
+        assert!(start < end);
+    }
+
+    #[test]
+    fn test_date_range_all_time_starts_2020() {
+        let (start, _end) = DateRangeSelection::AllTime.date_range();
+        assert_eq!(start, "2020-01-01");
     }
 }
