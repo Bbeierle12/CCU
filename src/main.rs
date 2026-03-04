@@ -106,11 +106,14 @@ fn main() -> eframe::Result<()> {
         for (_path, records) in &scan_results {
             s.ingest(records, &settings);
         }
+        let window_usage = s.model_window_usage(settings.usage_window_hours);
         println!(
-            "Initial scan: {} sessions, {} messages, ${:.2} estimated",
+            "Initial scan: {} sessions, {} messages, ${:.2} estimated, model_usage_window: {} entries, window_usage: {:?}",
             s.sessions.len(),
             s.total_messages,
-            s.estimated_cost(&settings)
+            s.estimated_cost(&settings),
+            s.model_usage_window.len(),
+            window_usage
         );
     }
 
@@ -335,6 +338,7 @@ impl eframe::App for UsageApp {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             s.prune_burn_window(self.settings.burn_rate_window_minutes);
+            s.prune_model_usage_window(self.settings.usage_window_hours);
             if s.dirty {
                 self.cached_state = s.clone();
                 s.dirty = false;

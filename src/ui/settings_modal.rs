@@ -34,7 +34,7 @@ impl SettingsModal {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .collapsible(false)
             .resizable(false)
-            .fixed_size([440.0, 520.0])
+            .fixed_size([440.0, 620.0])
             .open(&mut x_closed)
             .show(ctx, |ui| {
                 self.render_contents(ui);
@@ -153,6 +153,65 @@ impl SettingsModal {
                 &mut self.draft.haiku_pricing,
                 "Haiku",
             );
+            ui.add_space(8.0);
+
+            // ── Plan Limits ──
+            ui.strong("Plan Limits");
+            ui.add_space(2.0);
+            egui::Grid::new("plan_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Plan tier:");
+                    egui::ComboBox::from_id_salt("plan_tier")
+                        .selected_text(self.draft.plan_tier.label())
+                        .show_ui(ui, |ui| {
+                            let prev_tier = self.draft.plan_tier;
+                            for tier in crate::settings::PlanTier::ALL {
+                                ui.selectable_value(
+                                    &mut self.draft.plan_tier,
+                                    tier,
+                                    tier.label(),
+                                );
+                            }
+                            if self.draft.plan_tier != prev_tier {
+                                self.draft.apply_tier_defaults();
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label("Window (hours):");
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft.usage_window_hours)
+                            .range(0.5..=24.0)
+                            .speed(0.5),
+                    );
+                    ui.end_row();
+
+                    ui.label("Opus limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft.opus_output_limit)
+                            .range(0..=100_000_000u64)
+                            .speed(10000.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Sonnet limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft.sonnet_output_limit)
+                            .range(0..=100_000_000u64)
+                            .speed(10000.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Haiku limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.draft.haiku_output_limit)
+                            .range(0..=100_000_000u64)
+                            .speed(10000.0),
+                    );
+                    ui.end_row();
+                });
             ui.add_space(8.0);
 
             // ── Paths (read-only) ──

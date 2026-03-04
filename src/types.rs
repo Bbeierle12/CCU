@@ -459,6 +459,8 @@ pub struct MetricsState {
     pub tools: HashMap<String, u64>,
     pub branches: HashMap<String, BranchMetrics>,
     pub burn_window: VecDeque<(DateTime<Utc>, u64)>,
+    /// Rolling window of (timestamp, model_name, output_tokens) for plan usage tracking.
+    pub model_usage_window: VecDeque<(DateTime<Utc>, String, u64)>,
     pub total_input: u64,
     pub total_output: u64,
     pub total_cache_creation: u64,

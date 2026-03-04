@@ -325,6 +325,15 @@ impl MetricsState {
                     self.burn_window
                         .push_back((rec.timestamp, rec.output_tokens));
 
+                    // Model usage window for plan limit tracking
+                    if rec.output_tokens > 0 {
+                        self.model_usage_window.push_back((
+                            rec.timestamp,
+                            rec.model.clone(),
+                            rec.output_tokens,
+                        ));
+                    }
+
                     // Per-project token accounting
                     project.input_tokens += rec.input_tokens;
                     project.output_tokens += rec.output_tokens;
@@ -644,6 +653,31 @@ impl MetricsState {
         {
             self.burn_window.pop_front();
         }
+    }
+
+    /// Prune model usage window entries older than the given hours.
+    pub fn prune_model_usage_window(&mut self, window_hours: f64) {
+        let cutoff = Utc::now() - Duration::minutes((window_hours * 60.0) as i64);
+        while self
+            .model_usage_window
+            .front()
+            .is_some_and(|(ts, _, _)| *ts < cutoff)
+        {
+            self.model_usage_window.pop_front();
+        }
+    }
+
+    /// Sum output tokens per model within the rolling usage window.
+    /// Returns a map of model_name -> total_output_tokens.
+    pub fn model_window_usage(&self, window_hours: f64) -> std::collections::HashMap<String, u64> {
+        let cutoff = Utc::now() - Duration::minutes((window_hours * 60.0) as i64);
+        let mut usage = std::collections::HashMap::new();
+        for (ts, model, tokens) in &self.model_usage_window {
+            if *ts >= cutoff {
+                *usage.entry(model.clone()).or_insert(0) += tokens;
+            }
+        }
+        usage
     }
 
     /// Total estimated cost across all models today.

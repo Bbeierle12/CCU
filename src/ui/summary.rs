@@ -56,6 +56,84 @@ pub fn render(ui: &mut egui::Ui, state: &MetricsState, settings: &Settings) {
 
     ui.separator();
 
+    // Usage limit bars (per-model output tokens vs plan limits)
+    {
+        let window_usage = state.model_window_usage(settings.usage_window_hours);
+        // Collect models that have limits configured, in fixed order
+        let bar_models: Vec<(&str, &str, u64, egui::Color32)> = vec![
+            ("opus", "Opus", settings.opus_output_limit, egui::Color32::from_rgb(180, 100, 255)),
+            ("sonnet", "Sonnet", settings.sonnet_output_limit, egui::Color32::from_rgb(100, 180, 255)),
+            ("haiku", "Haiku", settings.haiku_output_limit, egui::Color32::from_rgb(100, 220, 180)),
+        ];
+
+        // Only show if there's any usage in the window
+        let has_usage = window_usage.values().any(|&v| v > 0);
+        if has_usage {
+            ui.label(format!(
+                "Plan Usage ({:.0}h window, {})",
+                settings.usage_window_hours,
+                settings.plan_tier.label()
+            ));
+            ui.add_space(2.0);
+
+            for (key, label, limit, base_color) in &bar_models {
+                // Sum usage across all model variants matching this key
+                let used: u64 = window_usage
+                    .iter()
+                    .filter(|(name, _)| name.contains(key))
+                    .map(|(_, v)| *v)
+                    .sum();
+                if used == 0 {
+                    continue;
+                }
+                let pct = if *limit > 0 {
+                    (used as f64 / *limit as f64).min(1.0)
+                } else {
+                    0.0
+                };
+                let pct_display = (pct * 100.0) as u32;
+
+                // Color based on usage level
+                let bar_color = if pct < 0.60 {
+                    egui::Color32::from_rgb(0, 200, 80) // green
+                } else if pct < 0.85 {
+                    egui::Color32::from_rgb(255, 200, 50) // yellow
+                } else {
+                    egui::Color32::from_rgb(255, 80, 60) // red
+                };
+
+                ui.horizontal(|ui| {
+                    ui.colored_label(*base_color, format!("{:6}", label));
+                    let available_width = ui.available_width() - 120.0;
+                    let bar_width = available_width.max(60.0);
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(bar_width, 14.0),
+                        egui::Sense::hover(),
+                    );
+                    // Background
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        egui::Color32::from_rgb(40, 40, 40),
+                    );
+                    // Filled portion
+                    let filled_rect = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width() * pct as f32, rect.height()),
+                    );
+                    ui.painter().rect_filled(filled_rect, 2.0, bar_color);
+
+                    ui.label(format!(
+                        "{}% ({})",
+                        pct_display,
+                        crate::types::format_tokens(used)
+                    ));
+                });
+            }
+            ui.separator();
+        }
+    }
+
     // Model breakdown (compact inline, sorted for deterministic order)
     if !state.models.is_empty() {
         ui.horizontal_wrapped(|ui| {

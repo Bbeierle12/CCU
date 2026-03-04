@@ -1,6 +1,42 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Subscription plan tier, determines default usage limits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum PlanTier {
+    Pro,
+    Max5x,
+    Max20x,
+}
+
+impl PlanTier {
+    pub const ALL: [PlanTier; 3] = [PlanTier::Pro, PlanTier::Max5x, PlanTier::Max20x];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlanTier::Pro => "Pro",
+            PlanTier::Max5x => "Max 5x",
+            PlanTier::Max20x => "Max 20x",
+        }
+    }
+
+    /// Default output token limits per 5-hour window for each tier.
+    /// Returns (opus, sonnet, haiku).
+    pub fn default_limits(self) -> (u64, u64, u64) {
+        match self {
+            PlanTier::Pro => (100_000, 400_000, 800_000),
+            PlanTier::Max5x => (500_000, 2_000_000, 4_000_000),
+            PlanTier::Max20x => (2_000_000, 8_000_000, 16_000_000),
+        }
+    }
+}
+
+impl Default for PlanTier {
+    fn default() -> Self {
+        PlanTier::Max20x
+    }
+}
+
 /// Per-model pricing in USD per million tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelPricing {
@@ -49,6 +85,13 @@ pub struct Settings {
     pub opus_pricing: ModelPricing,
     pub sonnet_pricing: ModelPricing,
     pub haiku_pricing: ModelPricing,
+
+    // Plan usage limits
+    pub plan_tier: PlanTier,
+    pub usage_window_hours: f64,
+    pub opus_output_limit: u64,
+    pub sonnet_output_limit: u64,
+    pub haiku_output_limit: u64,
 }
 
 impl Default for Settings {
@@ -81,6 +124,11 @@ impl Default for Settings {
                 cache_write_per_m: 1.0,
                 cache_read_per_m: 0.08,
             },
+            plan_tier: PlanTier::default(),
+            usage_window_hours: 5.0,
+            opus_output_limit: 2_000_000,
+            sonnet_output_limit: 8_000_000,
+            haiku_output_limit: 16_000_000,
         }
     }
 }
@@ -113,6 +161,25 @@ impl Settings {
             + cache_creation as f64 * cw_rate
             + cache_read as f64 * cr_rate)
             / 1_000_000.0
+    }
+
+    /// Returns the output token limit for a model within the usage window.
+    pub fn output_limit_for_model(&self, model: &str) -> u64 {
+        if model.contains("opus") {
+            self.opus_output_limit
+        } else if model.contains("haiku") {
+            self.haiku_output_limit
+        } else {
+            self.sonnet_output_limit
+        }
+    }
+
+    /// Apply default limits from the current plan tier.
+    pub fn apply_tier_defaults(&mut self) {
+        let (opus, sonnet, haiku) = self.plan_tier.default_limits();
+        self.opus_output_limit = opus;
+        self.sonnet_output_limit = sonnet;
+        self.haiku_output_limit = haiku;
     }
 
     /// Validate settings. Returns errors for invalid combinations.
