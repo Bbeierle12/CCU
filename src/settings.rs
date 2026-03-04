@@ -38,6 +38,8 @@ pub struct Settings {
 
     // Session timing
     pub active_session_threshold_minutes: i64,
+    /// Gaps longer than this between consecutive messages are counted as idle.
+    pub idle_gap_minutes: i64,
 
     // Window size
     pub window_width: f32,
@@ -58,6 +60,7 @@ impl Default for Settings {
             burn_rate_low: 500.0,
             burn_rate_high: 2000.0,
             active_session_threshold_minutes: 5,
+            idle_gap_minutes: 5,
             window_width: 600.0,
             window_height: 720.0,
             opus_pricing: ModelPricing {

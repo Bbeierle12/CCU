@@ -4,12 +4,18 @@ use chrono::{Duration, Utc};
 
 use crate::parser;
 use crate::settings::Settings;
-use crate::types::{BranchMetrics, MessageRecord, MetricsState, ProjectMetrics, SessionMetrics};
+use crate::types::{
+    BranchMetrics, MessageRecord, MessageType, MetricsState, PendingToolUse, ProjectMetrics,
+    SessionMetrics,
+};
 
 impl MetricsState {
-    /// Ingest a batch of new message records.
+    /// Ingest a batch of new message records (assistant, user prompt, or tool result).
     /// Does NOT prune the burn window — call `prune_burn_window()` on the main thread.
-    pub fn ingest(&mut self, records: &[MessageRecord]) {
+    ///
+    /// Pass `idle_gap_minutes` from settings to detect idle gaps between messages.
+    /// Use 0 to disable idle gap detection.
+    pub fn ingest(&mut self, records: &[MessageRecord], idle_gap_minutes: i64) {
         let today = Utc::now().date_naive();
 
         for rec in records {
@@ -19,10 +25,6 @@ impl MetricsState {
             }
 
             self.total_messages += 1;
-            self.total_input += rec.input_tokens;
-            self.total_output += rec.output_tokens;
-            self.total_cache_creation += rec.cache_creation_tokens;
-            self.total_cache_read += rec.cache_read_tokens;
 
             // Update last_updated
             match self.last_updated {
@@ -31,7 +33,7 @@ impl MetricsState {
                 _ => {}
             }
 
-            // Per-session
+            // Per-session (common to all types)
             let session = self
                 .sessions
                 .entry(rec.session_id.clone())
@@ -46,11 +48,29 @@ impl MetricsState {
                     cache_read_tokens: 0,
                     message_count: 0,
                     branch: String::new(),
+                    user_message_count: 0,
+                    tool_result_count: 0,
+                    tool_error_count: 0,
+                    assistant_text_length: 0,
+                    user_text_length: 0,
+                    assistant_message_count: 0,
+                    turn_count: 0,
+                    idle_gap_count: 0,
+                    total_idle_secs: 0,
+                    assistant_word_count: 0,
+                    user_word_count: 0,
                 });
-            session.input_tokens += rec.input_tokens;
-            session.output_tokens += rec.output_tokens;
-            session.cache_creation_tokens += rec.cache_creation_tokens;
-            session.cache_read_tokens += rec.cache_read_tokens;
+
+            // Idle gap detection: compare with previous last_seen BEFORE updating
+            if session.message_count > 0 && idle_gap_minutes > 0 {
+                let gap_secs = (rec.timestamp - session.last_seen).num_seconds();
+                let threshold_secs = idle_gap_minutes * 60;
+                if gap_secs > threshold_secs {
+                    session.idle_gap_count += 1;
+                    session.total_idle_secs += gap_secs;
+                }
+            }
+
             session.message_count += 1;
             if rec.timestamp > session.last_seen {
                 session.last_seen = rec.timestamp;
@@ -58,41 +78,12 @@ impl MetricsState {
             if rec.timestamp < session.first_seen {
                 session.first_seen = rec.timestamp;
             }
-            // Use the latest model seen
-            if !rec.model.is_empty() && rec.model != "unknown" {
-                session.model = rec.model.clone();
-            }
             // Use the latest non-empty branch
             if !rec.git_branch.is_empty() {
                 session.branch = rec.git_branch.clone();
             }
 
-            // Per-tool
-            for tool_name in &rec.tool_names {
-                *self.tools.entry(tool_name.clone()).or_insert(0) += 1;
-            }
-
-            // Per-branch
-            if !rec.git_branch.is_empty() {
-                let branch = self
-                    .branches
-                    .entry(rec.git_branch.clone())
-                    .or_insert_with(|| BranchMetrics {
-                        name: rec.git_branch.clone(),
-                        ..Default::default()
-                    });
-                branch.input_tokens += rec.input_tokens;
-                branch.output_tokens += rec.output_tokens;
-                branch.cache_creation_tokens += rec.cache_creation_tokens;
-                branch.cache_read_tokens += rec.cache_read_tokens;
-                branch.message_count += 1;
-            }
-
-            // Burn window
-            self.burn_window
-                .push_back((rec.timestamp, rec.output_tokens));
-
-            // Per-project
+            // Per-project (common: create entry, count sessions)
             let project_name = parser::short_project_name(&rec.cwd);
             let project = self
                 .projects
@@ -101,24 +92,112 @@ impl MetricsState {
                     name: project_name,
                     ..Default::default()
                 });
-            project.input_tokens += rec.input_tokens;
-            project.output_tokens += rec.output_tokens;
-            project.cache_creation_tokens += rec.cache_creation_tokens;
-            project.cache_read_tokens += rec.cache_read_tokens;
-            // Count unique sessions per project (increment only on first record for session)
-            // This is approximate — fine for a widget
             if session.message_count == 1 {
                 project.session_count += 1;
             }
 
-            // Per-model
-            let model_key = friendly_model_name(&rec.model);
-            let model_metrics = self.models.entry(model_key.to_string()).or_default();
-            model_metrics.input_tokens += rec.input_tokens;
-            model_metrics.output_tokens += rec.output_tokens;
-            model_metrics.cache_creation_tokens += rec.cache_creation_tokens;
-            model_metrics.cache_read_tokens += rec.cache_read_tokens;
-            model_metrics.message_count += 1;
+            // Type-specific accumulation
+            match rec.message_type {
+                MessageType::Assistant => {
+                    session.assistant_message_count += 1;
+
+                    // Token accounting (only assistant lines have usage data)
+                    self.total_input += rec.input_tokens;
+                    self.total_output += rec.output_tokens;
+                    self.total_cache_creation += rec.cache_creation_tokens;
+                    self.total_cache_read += rec.cache_read_tokens;
+
+                    session.input_tokens += rec.input_tokens;
+                    session.output_tokens += rec.output_tokens;
+                    session.cache_creation_tokens += rec.cache_creation_tokens;
+                    session.cache_read_tokens += rec.cache_read_tokens;
+                    session.assistant_text_length += rec.text_length;
+                    session.assistant_word_count += rec.text_word_count;
+
+                    // Use the latest model seen
+                    if !rec.model.is_empty() && rec.model != "unknown" {
+                        session.model = rec.model.clone();
+                    }
+
+                    // Per-tool invocation counting + stash pending for latency correlation
+                    for (i, tool_name) in rec.tool_names.iter().enumerate() {
+                        *self.tools.entry(tool_name.clone()).or_insert(0) += 1;
+
+                        // Stash pending tool_use for latency correlation
+                        if let Some(tool_use_id) = rec.tool_use_ids.get(i) {
+                            self.pending_tool_uses.insert(
+                                tool_use_id.clone(),
+                                PendingToolUse {
+                                    timestamp: rec.timestamp,
+                                    tool_name: tool_name.clone(),
+                                    session_id: rec.session_id.clone(),
+                                },
+                            );
+                        }
+                    }
+
+                    // Per-branch (token accounting)
+                    if !rec.git_branch.is_empty() {
+                        let branch = self
+                            .branches
+                            .entry(rec.git_branch.clone())
+                            .or_insert_with(|| BranchMetrics {
+                                name: rec.git_branch.clone(),
+                                ..Default::default()
+                            });
+                        branch.input_tokens += rec.input_tokens;
+                        branch.output_tokens += rec.output_tokens;
+                        branch.cache_creation_tokens += rec.cache_creation_tokens;
+                        branch.cache_read_tokens += rec.cache_read_tokens;
+                        branch.message_count += 1;
+                    }
+
+                    // Burn window (output tokens)
+                    self.burn_window
+                        .push_back((rec.timestamp, rec.output_tokens));
+
+                    // Per-project token accounting
+                    project.input_tokens += rec.input_tokens;
+                    project.output_tokens += rec.output_tokens;
+                    project.cache_creation_tokens += rec.cache_creation_tokens;
+                    project.cache_read_tokens += rec.cache_read_tokens;
+
+                    // Per-model
+                    let model_key = friendly_model_name(&rec.model);
+                    let model_metrics =
+                        self.models.entry(model_key.to_string()).or_default();
+                    model_metrics.input_tokens += rec.input_tokens;
+                    model_metrics.output_tokens += rec.output_tokens;
+                    model_metrics.cache_creation_tokens += rec.cache_creation_tokens;
+                    model_metrics.cache_read_tokens += rec.cache_read_tokens;
+                    model_metrics.message_count += 1;
+                }
+                MessageType::UserPrompt => {
+                    session.user_message_count += 1;
+                    session.user_text_length += rec.text_length;
+                    session.user_word_count += rec.text_word_count;
+                    session.turn_count += 1;
+                }
+                MessageType::ToolResult => {
+                    session.tool_result_count += 1;
+                    let is_error = rec.is_tool_error == Some(true);
+                    if is_error {
+                        session.tool_error_count += 1;
+                    }
+
+                    // Correlate with pending tool_use for latency
+                    for tool_use_id in &rec.tool_use_ids {
+                        if let Some(pending) = self.pending_tool_uses.remove(tool_use_id) {
+                            let latency_ms =
+                                (rec.timestamp - pending.timestamp).num_milliseconds();
+                            self.tool_latencies
+                                .entry(pending.tool_name)
+                                .or_default()
+                                .record(latency_ms, is_error);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -213,6 +292,35 @@ impl MetricsState {
         let window_minutes = settings.burn_rate_window_minutes as f64;
         total as f64 / window_minutes
     }
+
+    /// Effective burn rate: tokens/min excluding idle gaps in the burn window.
+    #[allow(dead_code)] // available for UI integration
+    /// Falls back to `burn_rate_per_minute` if no idle gaps detected.
+    pub fn effective_burn_rate(&self, settings: &Settings) -> f64 {
+        if self.burn_window.len() < 2 {
+            return self.burn_rate_per_minute(settings);
+        }
+
+        let total: u64 = self.burn_window.iter().map(|(_, tokens)| tokens).sum();
+        let idle_threshold_secs = settings.idle_gap_minutes * 60;
+
+        // Sum "active" time: consecutive gaps ≤ threshold
+        let mut active_secs: i64 = 0;
+        let entries: Vec<_> = self.burn_window.iter().collect();
+        for pair in entries.windows(2) {
+            let gap = (pair[1].0 - pair[0].0).num_seconds();
+            if gap <= idle_threshold_secs {
+                active_secs += gap;
+            }
+        }
+
+        if active_secs <= 0 {
+            return self.burn_rate_per_minute(settings);
+        }
+
+        let active_minutes = active_secs as f64 / 60.0;
+        total as f64 / active_minutes
+    }
 }
 
 fn friendly_model_name(model: &str) -> &str {
@@ -232,7 +340,7 @@ mod tests {
     use super::*;
     use crate::settings::Settings;
     use crate::types::{MessageRecord, MetricsState};
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
 
     fn make_record(session: &str, model: &str, input: u64, output: u64) -> MessageRecord {
         let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
@@ -247,6 +355,13 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         }
     }
 
@@ -257,7 +372,7 @@ mod tests {
             make_record("s1", "claude-sonnet-4-5", 100, 200),
             make_record("s1", "claude-sonnet-4-5", 150, 250),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.total_input, 250);
         assert_eq!(state.total_output, 450);
@@ -271,7 +386,7 @@ mod tests {
             make_record("s1", "claude-sonnet-4-5", 100, 200),
             make_record("s2", "claude-opus-4-5", 300, 400),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.sessions.len(), 2);
         assert_eq!(state.sessions["s1"].input_tokens, 100);
@@ -285,7 +400,7 @@ mod tests {
             make_record("s1", "claude-sonnet-4-5", 100, 200),
             make_record("s2", "claude-opus-4-5", 300, 400),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.models.len(), 2);
         assert!(state.models.contains_key("sonnet"));
@@ -296,7 +411,7 @@ mod tests {
     fn test_estimated_cost_nonzero() {
         let mut state = MetricsState::default();
         let records = vec![make_record("s1", "claude-sonnet-4-5", 1_000_000, 500_000)];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         let cost = state.estimated_cost(&Settings::default());
         assert!(cost > 0.0, "cost should be positive, got {}", cost);
@@ -326,8 +441,15 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         }];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.total_input, 0);
         assert_eq!(state.total_output, 0);
@@ -339,7 +461,7 @@ mod tests {
         let mut state = MetricsState::default();
         let records = vec![make_record("s1", "claude-sonnet-4-5", 100, 200)];
         let ts = records[0].timestamp;
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.last_updated, Some(ts));
     }
@@ -361,8 +483,15 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         };
-        state.ingest(&[rec1]);
+        state.ingest(&[rec1], 0);
         assert_eq!(state.sessions["s1"].model, "unknown");
 
         // Second record with real model
@@ -377,8 +506,15 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         };
-        state.ingest(&[rec2]);
+        state.ingest(&[rec2], 0);
         assert_eq!(state.sessions["s1"].model, "claude-sonnet-4-5");
     }
 
@@ -401,6 +537,13 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
             MessageRecord {
                 session_id: "middle".to_string(),
@@ -413,6 +556,13 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
             MessageRecord {
                 session_id: "newest".to_string(),
@@ -425,9 +575,16 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         let sorted = state.sessions_sorted();
         assert_eq!(sorted.len(), 3);
@@ -455,6 +612,13 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
             MessageRecord {
                 session_id: "s2".to_string(),
@@ -467,9 +631,16 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         let sorted = state.projects_sorted();
         assert_eq!(sorted.len(), 2);
@@ -496,6 +667,13 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
             // Stale — 30 minutes ago
             MessageRecord {
@@ -509,9 +687,16 @@ mod tests {
                 cache_read_tokens: 0,
                 tool_names: vec![],
                 git_branch: String::new(),
+                message_type: MessageType::Assistant,
+                uuid: String::new(),
+                parent_uuid: String::new(),
+                text_length: 0,
+                text_word_count: 0,
+                tool_use_ids: vec![],
+                is_tool_error: None,
             },
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.active_session_count(&Settings::default()), 1);
     }
@@ -538,6 +723,13 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: tools.into_iter().map(String::from).collect(),
             git_branch: branch.to_string(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         }
     }
 
@@ -548,7 +740,7 @@ mod tests {
             make_record_with_tools("s1", "sonnet", 10, 20, vec!["Bash", "Read"], ""),
             make_record_with_tools("s1", "sonnet", 10, 20, vec!["Bash", "Write"], ""),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.tools["Bash"], 2);
         assert_eq!(state.tools["Read"], 1);
@@ -562,7 +754,7 @@ mod tests {
             make_record_with_tools("s1", "sonnet", 10, 20, vec!["Bash", "Read", "Bash"], ""),
             make_record_with_tools("s1", "sonnet", 10, 20, vec!["Write"], ""),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         let sorted = state.tools_sorted();
         assert_eq!(*sorted[0].0, "Bash");
@@ -576,7 +768,7 @@ mod tests {
             make_record_with_tools("s1", "sonnet", 100, 200, vec![], "main"),
             make_record_with_tools("s2", "sonnet", 300, 400, vec![], "feature/auth"),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.branches.len(), 2);
         assert_eq!(state.branches["main"].input_tokens, 100);
@@ -592,7 +784,7 @@ mod tests {
             make_record_with_tools("s1", "sonnet", 100, 100, vec![], "small-branch"),
             make_record_with_tools("s2", "sonnet", 1000, 1000, vec![], "big-branch"),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         let sorted = state.branches_sorted();
         assert_eq!(sorted[0].name, "big-branch");
@@ -606,7 +798,7 @@ mod tests {
             make_record_with_tools("s1", "sonnet", 10, 20, vec![], "old-branch"),
             make_record_with_tools("s1", "sonnet", 10, 20, vec![], "new-branch"),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.sessions["s1"].branch, "new-branch");
     }
@@ -615,7 +807,7 @@ mod tests {
     fn test_empty_branch_not_tracked() {
         let mut state = MetricsState::default();
         let records = vec![make_record_with_tools("s1", "sonnet", 10, 20, vec![], "")];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert!(state.branches.is_empty());
     }
@@ -624,7 +816,7 @@ mod tests {
     fn test_burn_window_populated() {
         let mut state = MetricsState::default();
         let records = vec![make_record_with_tools("s1", "sonnet", 10, 200, vec![], "")];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert_eq!(state.burn_window.len(), 1);
         assert_eq!(state.burn_window[0].1, 200);
@@ -656,8 +848,316 @@ mod tests {
             make_record("s1", "sonnet", 10, 20),
             make_record("s2", "sonnet", 30, 40),
         ];
-        state.ingest(&records);
+        state.ingest(&records, 0);
 
         assert!(state.tools.is_empty());
+    }
+
+    // ── Phase 1: parser widening aggregator tests ────────────
+
+    fn make_user_prompt(session: &str, text_length: u64) -> MessageRecord {
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        MessageRecord {
+            session_id: session.to_string(),
+            timestamp: Utc::now(),
+            cwd: format!("{}/test-project", home),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            tool_names: vec![],
+            git_branch: String::new(),
+            message_type: MessageType::UserPrompt,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
+        }
+    }
+
+    fn make_tool_result(session: &str, is_error: bool) -> MessageRecord {
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        MessageRecord {
+            session_id: session.to_string(),
+            timestamp: Utc::now(),
+            cwd: format!("{}/test-project", home),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            tool_names: vec![],
+            git_branch: String::new(),
+            message_type: MessageType::ToolResult,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec!["toolu_test".to_string()],
+            is_tool_error: Some(is_error),
+        }
+    }
+
+    #[test]
+    fn test_ingest_user_prompt_increments_counter() {
+        let mut state = MetricsState::default();
+        state.ingest(&[
+            make_user_prompt("s1", 42),
+            make_user_prompt("s1", 10),
+        ], 0);
+
+        let s = &state.sessions["s1"];
+        assert_eq!(s.user_message_count, 2);
+        assert_eq!(s.user_text_length, 52);
+        // Should not affect token counts
+        assert_eq!(s.input_tokens, 0);
+        assert_eq!(s.output_tokens, 0);
+        assert_eq!(state.total_input, 0);
+        assert_eq!(state.total_output, 0);
+    }
+
+    #[test]
+    fn test_ingest_tool_result_increments_counter() {
+        let mut state = MetricsState::default();
+        state.ingest(&[
+            make_tool_result("s1", false),
+            make_tool_result("s1", false),
+            make_tool_result("s1", true),
+        ], 0);
+
+        let s = &state.sessions["s1"];
+        assert_eq!(s.tool_result_count, 3);
+        assert_eq!(s.tool_error_count, 1);
+        assert_eq!(s.input_tokens, 0);
+    }
+
+    #[test]
+    fn test_ingest_mixed_types_same_session() {
+        let mut state = MetricsState::default();
+        state.ingest(&[
+            make_user_prompt("s1", 20),
+            make_record("s1", "sonnet", 100, 200),
+            make_tool_result("s1", false),
+            make_record("s1", "sonnet", 50, 100),
+            make_tool_result("s1", true),
+        ], 0);
+
+        let s = &state.sessions["s1"];
+        assert_eq!(s.message_count, 5);
+        assert_eq!(s.user_message_count, 1);
+        assert_eq!(s.tool_result_count, 2);
+        assert_eq!(s.tool_error_count, 1);
+        assert_eq!(s.user_text_length, 20);
+        assert_eq!(s.input_tokens, 150);
+        assert_eq!(s.output_tokens, 300);
+        assert_eq!(state.total_input, 150);
+        assert_eq!(state.total_output, 300);
+        assert_eq!(state.total_messages, 5);
+    }
+
+    #[test]
+    fn test_user_prompt_does_not_affect_burn_window() {
+        let mut state = MetricsState::default();
+        state.ingest(&[make_user_prompt("s1", 100)], 0);
+
+        assert!(state.burn_window.is_empty());
+    }
+
+    #[test]
+    fn test_tool_result_does_not_create_model_entry() {
+        let mut state = MetricsState::default();
+        state.ingest(&[make_tool_result("s1", false)], 0);
+
+        // Tool results have empty model — should not create a model entry
+        // (or at least not add to token counts)
+        assert!(state.models.is_empty() || state.models.values().all(|m| m.message_count == 0));
+    }
+
+    // ── Phase 2: Correlation engine tests ────────────────
+
+    fn make_record_at(
+        session: &str,
+        msg_type: MessageType,
+        ts: DateTime<Utc>,
+        tool_names: Vec<&str>,
+        tool_use_ids: Vec<&str>,
+        is_error: Option<bool>,
+    ) -> MessageRecord {
+        let home = dirs::home_dir().unwrap().to_string_lossy().to_string();
+        MessageRecord {
+            session_id: session.to_string(),
+            timestamp: ts,
+            cwd: format!("{}/test-project", home),
+            model: if msg_type == MessageType::Assistant {
+                "sonnet".to_string()
+            } else {
+                String::new()
+            },
+            input_tokens: if msg_type == MessageType::Assistant { 10 } else { 0 },
+            output_tokens: if msg_type == MessageType::Assistant { 20 } else { 0 },
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            tool_names: tool_names.into_iter().map(String::from).collect(),
+            git_branch: String::new(),
+            message_type: msg_type,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: tool_use_ids.into_iter().map(String::from).collect(),
+            is_tool_error: is_error,
+        }
+    }
+
+    #[test]
+    fn test_turn_count_equals_user_prompts() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        state.ingest(&[
+            make_record_at("s1", MessageType::UserPrompt, now, vec![], vec![], None),
+            make_record_at("s1", MessageType::Assistant, now, vec![], vec![], None),
+            make_record_at("s1", MessageType::UserPrompt, now, vec![], vec![], None),
+            make_record_at("s1", MessageType::Assistant, now, vec![], vec![], None),
+        ], 0);
+
+        assert_eq!(state.sessions["s1"].turn_count, 2);
+        assert_eq!(state.sessions["s1"].assistant_message_count, 2);
+    }
+
+    #[test]
+    fn test_idle_gap_detection() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        let six_min_ago = now - chrono::Duration::minutes(6);
+
+        // First message at t-6min, second at t-0 → 6 minute gap, threshold 5
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, six_min_ago, vec![], vec![], None),
+        ], 5);
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec![], vec![], None),
+        ], 5);
+
+        let s = &state.sessions["s1"];
+        assert_eq!(s.idle_gap_count, 1);
+        assert!(s.total_idle_secs >= 360); // ~6 minutes in seconds
+    }
+
+    #[test]
+    fn test_no_idle_gap_below_threshold() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        let two_min_ago = now - chrono::Duration::minutes(2);
+
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, two_min_ago, vec![], vec![], None),
+        ], 5);
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec![], vec![], None),
+        ], 5);
+
+        assert_eq!(state.sessions["s1"].idle_gap_count, 0);
+        assert_eq!(state.sessions["s1"].total_idle_secs, 0);
+    }
+
+    #[test]
+    fn test_idle_gap_disabled_when_zero() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        let hour_ago = now - chrono::Duration::hours(1);
+
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, hour_ago, vec![], vec![], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec![], vec![], None),
+        ], 0);
+
+        assert_eq!(state.sessions["s1"].idle_gap_count, 0);
+    }
+
+    #[test]
+    fn test_tool_latency_correlation() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        let later = now + chrono::Duration::milliseconds(1500);
+
+        // Assistant sends tool_use with id "t1", tool name "Bash"
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec!["Bash"], vec!["t1"], None),
+        ], 0);
+
+        // Tool result arrives 1500ms later
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, later, vec![], vec!["t1"], Some(false)),
+        ], 0);
+
+        assert!(state.pending_tool_uses.is_empty()); // consumed
+        assert_eq!(state.tool_latencies.len(), 1);
+        let stats = &state.tool_latencies["Bash"];
+        assert_eq!(stats.call_count, 1);
+        assert!((stats.total_ms - 1500).abs() <= 1); // allow 1ms tolerance
+        assert_eq!(stats.error_count, 0);
+    }
+
+    #[test]
+    fn test_tool_latency_with_error() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+        let later = now + chrono::Duration::milliseconds(500);
+
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec!["Read"], vec!["t2"], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, later, vec![], vec!["t2"], Some(true)),
+        ], 0);
+
+        let stats = &state.tool_latencies["Read"];
+        assert_eq!(stats.call_count, 1);
+        assert_eq!(stats.error_count, 1);
+        assert!((stats.error_rate() - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tool_latency_multiple_calls() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+
+        // Two Bash calls with different latencies
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now, vec!["Bash"], vec!["t1"], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, now + chrono::Duration::milliseconds(1000), vec![], vec!["t1"], Some(false)),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::Assistant, now + chrono::Duration::seconds(2), vec!["Bash"], vec!["t2"], None),
+        ], 0);
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, now + chrono::Duration::milliseconds(3000), vec![], vec!["t2"], Some(false)),
+        ], 0);
+
+        let stats = &state.tool_latencies["Bash"];
+        assert_eq!(stats.call_count, 2);
+        assert!((stats.avg_ms() - 1000.0).abs() < 5.0); // avg of 1000ms and 1000ms
+        assert_eq!(stats.min_ms, Some(1000));
+        assert_eq!(stats.max_ms, Some(1000));
+    }
+
+    #[test]
+    fn test_unmatched_tool_result_ignored() {
+        let mut state = MetricsState::default();
+        let now = Utc::now();
+
+        // Tool result with no preceding tool_use → no latency recorded
+        state.ingest(&[
+            make_record_at("s1", MessageType::ToolResult, now, vec![], vec!["orphan"], Some(false)),
+        ], 0);
+
+        assert!(state.tool_latencies.is_empty());
     }
 }

@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_new_lines_skips_non_assistant() {
+    fn test_read_new_lines_parses_mixed_types() {
         let path = temp_jsonl("mixed_roles.jsonl");
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "{}", make_user_line("s1")).unwrap();
@@ -343,9 +343,11 @@ mod tests {
 
         let mut tracker = FileTracker::new();
         let recs = tracker.read_new_lines(&path);
-        assert_eq!(recs.len(), 2); // only assistant lines
-        assert_eq!(recs[0].input_tokens, 10);
-        assert_eq!(recs[1].input_tokens, 30);
+        assert_eq!(recs.len(), 4); // user + assistant lines all parse
+        assert_eq!(recs[0].message_type, crate::types::MessageType::UserPrompt);
+        assert_eq!(recs[1].message_type, crate::types::MessageType::Assistant);
+        assert_eq!(recs[1].input_tokens, 10);
+        assert_eq!(recs[3].input_tokens, 30);
 
         fs::remove_file(&path).ok();
     }

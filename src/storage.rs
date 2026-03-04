@@ -333,6 +333,17 @@ impl Storage {
                     cache_read_tokens: cache_read,
                     message_count: msg_count,
                     branch,
+                    user_message_count: 0,
+                    tool_result_count: 0,
+                    tool_error_count: 0,
+                    assistant_text_length: 0,
+                    user_text_length: 0,
+                    assistant_message_count: 0,
+                    turn_count: 0,
+                    idle_gap_count: 0,
+                    total_idle_secs: 0,
+                    assistant_word_count: 0,
+                    user_word_count: 0,
                 },
             );
         }
@@ -464,7 +475,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::MessageRecord;
+    use crate::types::{MessageRecord, MessageType};
     use chrono::Utc;
 
     fn test_cwd() -> String {
@@ -485,6 +496,13 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         }
     }
 
@@ -507,6 +525,13 @@ mod tests {
             cache_read_tokens: 0,
             tool_names: vec![],
             git_branch: String::new(),
+            message_type: MessageType::Assistant,
+            uuid: String::new(),
+            parent_uuid: String::new(),
+            text_length: 0,
+            text_word_count: 0,
+            tool_use_ids: vec![],
+            is_tool_error: None,
         }
     }
 

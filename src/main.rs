@@ -50,11 +50,13 @@ fn main() -> eframe::Result<()> {
     };
     let db = Arc::new(Mutex::new(db));
 
-    // Handle --backfill mode
-    if backfill {
+    // Backfill: always persist all JSONL data to SQLite on startup.
+    // This is fast (upsert is idempotent) and ensures historical data is available.
+    // With --backfill flag, run backfill only and exit.
+    {
         println!("Backfilling database from JSONL files...");
-        let mut tracker = watcher::FileTracker::new();
-        let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
+        let mut bf_tracker = watcher::FileTracker::new();
+        let scan_results = watcher::initial_scan(&projects_dir, &mut bf_tracker);
         let db_lock = db.lock().expect("db mutex poisoned");
         let mut total_records = 0u64;
         for (_path, records) in &scan_results {
@@ -73,48 +75,22 @@ fn main() -> eframe::Result<()> {
         } else {
             println!("Backfill complete: {} records", total_records);
         }
-        std::process::exit(0);
+        if backfill {
+            std::process::exit(0);
+        }
     }
 
     // Shared state between watcher thread and UI
     let state = Arc::new(Mutex::new(MetricsState::default()));
 
-    // Try loading today's data from SQLite first
-    let today = storage::today_str();
-    let loaded_from_db = {
-        let db_lock = db.lock().expect("db mutex poisoned");
-        if let Ok(true) = db_lock.has_data_for_date(&today) {
-            if let Ok(Some(loaded_state)) = db_lock.load_today() {
-                let mut s = state.lock().expect("metrics state mutex poisoned");
-                *s = loaded_state;
-                println!(
-                    "Loaded from DB: {} sessions, {} messages, ${:.2} estimated",
-                    s.sessions.len(),
-                    s.total_messages,
-                    s.estimated_cost(&settings)
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-
-    // FileTracker persists byte offsets so the watcher doesn't re-read
-    // content already ingested during initial scan
+    // Always build today's live state from JSONL scan (authoritative source).
+    // The DB backfill above handles historical data for sparklines.
     let mut tracker = watcher::FileTracker::new();
-
-    // Fallback: if DB had no data for today, do full JSONL scan
-    if !loaded_from_db {
+    {
         let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
         let mut s = state.lock().expect("metrics state mutex poisoned");
-        let db_lock = db.lock().expect("db mutex poisoned");
         for (_path, records) in &scan_results {
-            s.ingest(records);
-            // Persist to DB for next startup
-            let _ = db_lock.persist(records);
+            s.ingest(records, settings.idle_gap_minutes);
         }
         println!(
             "Initial scan: {} sessions, {} messages, ${:.2} estimated",
@@ -122,12 +98,6 @@ fn main() -> eframe::Result<()> {
             s.total_messages,
             s.estimated_cost(&settings)
         );
-    } else {
-        // If we loaded from DB, still need to mark existing files as read
-        // so the watcher doesn't re-process them
-        let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
-        // Don't ingest — just let tracker record offsets
-        drop(scan_results);
     }
 
     // Channel for new records from the file watcher
@@ -144,7 +114,7 @@ fn main() -> eframe::Result<()> {
     std::thread::spawn(move || {
         while let Ok(records) = rx.recv() {
             let mut s = state_writer.lock().expect("metrics state mutex poisoned");
-            s.ingest(&records);
+            s.ingest(&records, 0); // idle gap detection on main thread only
 
             // Write-through to SQLite
             if let Ok(db_lock) = db_writer.lock() {
