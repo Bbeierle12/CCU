@@ -383,7 +383,11 @@ fn extract_tool_output(tool_use_result: Option<&Value>) -> Option<ToolOutputDeta
     if let Some(stdout) = result.get("stdout").and_then(|s| s.as_str()) {
         if !stdout.is_empty() {
             let truncated = if stdout.len() > 500 {
-                &stdout[..500]
+                let mut end = 500;
+                while end > 0 && !stdout.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &stdout[..end]
             } else {
                 stdout
             };

@@ -106,14 +106,11 @@ fn main() -> eframe::Result<()> {
         for (_path, records) in &scan_results {
             s.ingest(records, &settings);
         }
-        let window_usage = s.model_window_usage(settings.usage_window_hours);
         println!(
-            "Initial scan: {} sessions, {} messages, ${:.2} estimated, model_usage_window: {} entries, window_usage: {:?}",
+            "Initial scan: {} sessions, {} messages, ${:.2} estimated",
             s.sessions.len(),
             s.total_messages,
-            s.estimated_cost(&settings),
-            s.model_usage_window.len(),
-            window_usage
+            s.estimated_cost(&settings)
         );
     }
 
