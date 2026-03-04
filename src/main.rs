@@ -104,7 +104,7 @@ fn main() -> eframe::Result<()> {
         let scan_results = watcher::initial_scan(&projects_dir, &mut tracker);
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         for (_path, records) in &scan_results {
-            s.ingest(records, settings.idle_gap_minutes);
+            s.ingest(records, &settings);
         }
         println!(
             "Initial scan: {} sessions, {} messages, ${:.2} estimated",
@@ -124,11 +124,11 @@ fn main() -> eframe::Result<()> {
     // Spawn a thread that drains the channel and updates shared state + DB
     let state_writer = Arc::clone(&state);
     let db_writer = Arc::clone(&db);
-    let writer_idle_gap = settings.idle_gap_minutes;
+    let writer_settings = settings.clone();
     std::thread::spawn(move || {
         while let Ok(records) = rx.recv() {
             let mut s = state_writer.lock().unwrap_or_else(|e| e.into_inner());
-            s.ingest(&records, writer_idle_gap);
+            s.ingest(&records, &writer_settings);
 
             // Write-through to SQLite
             if let Ok(db_lock) = db_writer.lock() {
@@ -173,6 +173,8 @@ fn main() -> eframe::Result<()> {
                 settings,
                 settings_modal: None,
                 cached_state: MetricsState::default(),
+                last_detail_persist: std::time::Instant::now(),
+                selected_tab: AnalyticsTab::Overview,
             }))
         }),
     )
@@ -210,13 +212,19 @@ impl DateRangeSelection {
     }
 }
 
-/// Cached historical data for sparklines.
+/// Cached historical data for sparklines and analytics.
 #[derive(Debug, Clone)]
 pub struct HistoricalData {
     /// (date, total_tokens, messages) per day
     pub daily_totals: Vec<(String, u64, f64)>,
     /// Per-project: project_name -> Vec<(date, total_tokens)>
     pub project_trends: std::collections::HashMap<String, Vec<(String, u64)>>,
+    /// Per-tool: tool_name -> Vec<(date, call_count)>
+    pub tool_detail_trends: std::collections::HashMap<String, Vec<(String, u64)>>,
+    /// Per-bash-category: category -> Vec<(date, count)>
+    pub bash_category_trends: std::collections::HashMap<String, Vec<(String, u64)>>,
+    /// Top files: (file_path, read, write, edit, grep)
+    pub file_activity_top: Vec<(String, u64, u64, u64, u64)>,
 }
 
 struct UsageApp {
@@ -232,6 +240,22 @@ struct UsageApp {
     settings_modal: Option<ui::settings_modal::SettingsModal>,
     /// Cached clone of MetricsState, only refreshed when dirty flag is set.
     cached_state: MetricsState,
+    /// Timer for periodic detail table persistence (30s interval).
+    last_detail_persist: std::time::Instant,
+    /// Selected analytics tab.
+    selected_tab: AnalyticsTab,
+}
+
+/// Analytics tab selection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AnalyticsTab {
+    Overview,
+    Behavior,
+    Files,
+    Bash,
+    Conversation,
+    Cost,
+    Chains,
 }
 
 impl UsageApp {
@@ -263,9 +287,22 @@ impl UsageApp {
             }
         }
 
+        let tool_detail_trends = db_lock
+            .daily_tool_details_range(&start, &end)
+            .unwrap_or_default();
+        let bash_category_trends = db_lock
+            .daily_bash_categories_range(&start, &end)
+            .unwrap_or_default();
+        let file_activity_top = db_lock
+            .daily_file_activity_top(&start, &end, 20)
+            .unwrap_or_default();
+
         self.historical_data = Some(HistoricalData {
             daily_totals,
             project_trends,
+            tool_detail_trends,
+            bash_category_trends,
+            file_activity_top,
         });
     }
 }
@@ -304,6 +341,15 @@ impl eframe::App for UsageApp {
             }
         }
 
+        // Persist detail tables every 30 seconds
+        if self.last_detail_persist.elapsed() >= std::time::Duration::from_secs(30) {
+            let today = storage::today_str();
+            if let Ok(db_lock) = self.db.lock() {
+                let _ = db_lock.persist_details(&today, &self.cached_state);
+            }
+            self.last_detail_persist = std::time::Instant::now();
+        }
+
         let state = &self.cached_state;
 
         // Check cost alert thresholds
@@ -325,6 +371,7 @@ impl eframe::App for UsageApp {
             &mut self.date_range_selection,
             &self.historical_data,
             &mut self.session_detail,
+            &mut self.selected_tab,
         );
 
         // Open settings modal on gear click

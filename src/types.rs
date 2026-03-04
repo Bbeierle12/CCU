@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The type of JSONL line this record was parsed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,9 +12,42 @@ pub enum MessageType {
     ToolResult,
 }
 
+/// Structured data extracted from tool_use input objects.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct ToolInputDetails {
+    pub bash_commands: Vec<String>,
+    pub file_paths: Vec<(String, String)>, // (file_path, tool_name)
+    pub edit_sizes: Vec<(u64, u64)>,       // (old_string.len, new_string.len)
+    pub search_patterns: Vec<String>,      // Grep/Glob input.pattern
+    pub urls: Vec<String>,                 // WebFetch input.url
+    pub web_queries: Vec<String>,          // WebSearch input.query
+    pub subagent_spawns: Vec<SubagentSpawn>,
+    pub todo_snapshots: Vec<String>,       // TodoWrite input JSON (serialized)
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SubagentSpawn {
+    pub subagent_type: String,
+    pub description: String,
+    pub model: Option<String>,
+}
+
+/// Structured data extracted from toolUseResult output objects.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct ToolOutputDetails {
+    pub bash_stdout: Option<String>,   // truncated to 500 chars
+    pub bash_return_code: Option<i32>,
+    pub write_type: Option<String>,    // "create" or "update"
+    pub patch_additions: u64,
+    pub patch_deletions: u64,
+}
+
 /// A parsed record from a JSONL line (assistant, user prompt, or tool result).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // uuid, parent_uuid, tool_use_ids consumed in Phase 2
+#[allow(dead_code)]
 pub struct MessageRecord {
     pub session_id: String,
     pub timestamp: DateTime<Utc>,
@@ -38,6 +71,10 @@ pub struct MessageRecord {
     pub tool_use_ids: Vec<String>,
     /// For tool_result lines: whether the tool reported an error.
     pub is_tool_error: Option<bool>,
+    /// Structured data extracted from tool_use input objects.
+    pub tool_input_details: Option<ToolInputDetails>,
+    /// Structured data extracted from toolUseResult output objects.
+    pub tool_output_details: Option<ToolOutputDetails>,
 }
 
 /// Aggregated metrics for a single session.
@@ -225,6 +262,194 @@ pub fn format_tokens(n: u64) -> String {
     }
 }
 
+// ── Behavioral analytics types ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum BashCategory {
+    Git,
+    PackageManager,
+    Test,
+    Lint,
+    Docker,
+    Network,
+    RuleViolation,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum GitSubCommand {
+    Diff,
+    Status,
+    Commit,
+    Push,
+    Branch,
+    Log,
+    Add,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[allow(dead_code)]
+pub enum SessionPhase {
+    #[default]
+    Unknown,
+    Explore,
+    Plan,
+    Implement,
+    Verify,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileTouch {
+    pub read_count: u64,
+    pub write_count: u64,
+    pub edit_count: u64,
+    pub grep_count: u64,
+}
+
+/// Per-session behavioral analytics.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct SessionBehavior {
+    pub search_ops: u64,
+    pub action_ops: u64,
+    pub unique_files_searched: HashSet<String>,
+    pub total_old_len: u64,
+    pub total_new_len: u64,
+    pub edit_op_count: u64,
+    pub bash_categories: HashMap<BashCategory, u64>,
+    pub git_sub_counts: HashMap<GitSubCommand, u64>,
+    pub total_bash_commands: u64,
+    pub recent_tool_calls: VecDeque<(String, String, DateTime<Utc>)>,
+    pub retry_count: u64,
+    pub tdd_sequence: VecDeque<char>,
+    pub tdd_cycle_count: u64,
+    pub current_turn_tools: Vec<String>,
+    pub tool_sequences: Vec<Vec<String>>,
+    pub tool_cooccurrence: HashMap<(String, String), u64>,
+    pub file_touches: HashMap<String, FileTouch>,
+    pub recently_written_files: HashSet<String>,
+    pub write_then_edit_count: u64,
+    pub current_phase: SessionPhase,
+    pub phase_transitions: Vec<(DateTime<Utc>, SessionPhase)>,
+    pub parent_to_children: HashMap<String, Vec<String>>,
+    pub max_tree_depth: u32,
+    pub branch_count: u32,
+    pub compaction_count: u64,
+    pub prompt_lengths: Vec<u64>,
+    pub question_count: u64,
+    pub directive_count: u64,
+    pub subagent_count: u64,
+    pub subagent_models: HashMap<String, u64>,
+    pub error_retry_count: u64,
+}
+
+impl SessionBehavior {
+    pub fn search_act_ratio(&self) -> f64 {
+        let total = self.search_ops + self.action_ops;
+        if total == 0 {
+            return 0.0;
+        }
+        self.search_ops as f64 / total as f64
+    }
+
+    pub fn exploration_breadth(&self) -> usize {
+        self.unique_files_searched.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn edit_precision(&self) -> f64 {
+        if self.total_old_len == 0 {
+            return 1.0;
+        }
+        self.total_new_len as f64 / self.total_old_len as f64
+    }
+
+    #[allow(dead_code)]
+    pub fn avg_prompt_length(&self) -> f64 {
+        if self.prompt_lengths.is_empty() {
+            return 0.0;
+        }
+        let sum: u64 = self.prompt_lengths.iter().sum();
+        sum as f64 / self.prompt_lengths.len() as f64
+    }
+
+    #[allow(dead_code)]
+    pub fn top_cooccurrences(&self, n: usize) -> Vec<((String, String), u64)> {
+        let mut sorted: Vec<_> = self.tool_cooccurrence.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        sorted.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+        sorted.truncate(n);
+        sorted
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct IdleGapBuckets {
+    pub rapid: u64,
+    pub normal: u64,
+    pub thinking: u64,
+    pub away: u64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Burst {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub message_count: u64,
+    pub tool_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TemporalPatterns {
+    pub idle_gap_buckets: IdleGapBuckets,
+    pub bursts: Vec<Burst>,
+    pub hour_distribution: [u64; 24],
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct CostIntelligence {
+    pub cost_per_tool: HashMap<String, f64>,
+    pub cache_efficiency_samples: VecDeque<(DateTime<Utc>, f64)>,
+    pub token_waste_events: u64,
+    pub token_waste_tokens: u64,
+    pub last_assistant_input: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileIntelligence {
+    pub global_file_touches: HashMap<String, FileTouch>,
+    pub extension_counts: HashMap<String, u64>,
+    pub total_path_depth: u64,
+    pub path_count: u64,
+}
+
+impl FileIntelligence {
+    pub fn avg_path_depth(&self) -> f64 {
+        if self.path_count == 0 {
+            return 0.0;
+        }
+        self.total_path_depth as f64 / self.path_count as f64
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct TodoIntelligence {
+    pub last_todo_input: HashMap<String, String>,
+    pub scope_changes: u64,
+    pub completions: u64,
+    pub todo_calls: u64,
+    pub total_todo_writes: u64,
+    pub total_edit_write_bash: u64,
+}
+
 /// The full metrics state, updated by the aggregator.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsState {
@@ -247,6 +472,12 @@ pub struct MetricsState {
     pub tool_latencies: HashMap<String, ToolLatencyStats>,
     /// Set to true when data changes; cleared by the UI after cloning.
     pub dirty: bool,
+    // ── Derived analytics ──
+    pub session_behaviors: HashMap<String, SessionBehavior>,
+    pub temporal: TemporalPatterns,
+    pub cost_intel: CostIntelligence,
+    pub file_intel: FileIntelligence,
+    pub todo_intel: TodoIntelligence,
 }
 
 #[cfg(test)]

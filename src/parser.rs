@@ -1,4 +1,4 @@
-use crate::types::{MessageRecord, MessageType};
+use crate::types::{MessageRecord, MessageType, SubagentSpawn, ToolInputDetails, ToolOutputDetails};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -75,12 +75,19 @@ fn parse_assistant(v: &Value) -> Option<MessageRecord> {
     let mut text_length: u64 = 0;
     let mut text_word_count: u64 = 0;
 
+    let mut tool_input_details = ToolInputDetails::default();
+    let mut has_tool_inputs = false;
+
     if let Some(arr) = content {
         for item in arr {
             match item.get("type").and_then(|t| t.as_str()) {
                 Some("tool_use") => {
                     if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
                         tool_names.push(name.to_string());
+                        if let Some(input) = item.get("input") {
+                            extract_tool_input(name, input, &mut tool_input_details);
+                            has_tool_inputs = true;
+                        }
                     }
                     if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
                         tool_use_ids.push(id.to_string());
@@ -134,7 +141,101 @@ fn parse_assistant(v: &Value) -> Option<MessageRecord> {
         text_word_count,
         tool_use_ids,
         is_tool_error: None,
+        tool_input_details: if has_tool_inputs { Some(tool_input_details) } else { None },
+        tool_output_details: None,
     })
+}
+
+/// Extract structured data from a tool_use input object.
+fn extract_tool_input(tool_name: &str, input: &Value, details: &mut ToolInputDetails) {
+    match tool_name {
+        "Bash" => {
+            if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+                details.bash_commands.push(cmd.to_string());
+            }
+        }
+        "Read" => {
+            if let Some(fp) = input.get("file_path").and_then(|p| p.as_str()) {
+                details.file_paths.push((fp.to_string(), "Read".to_string()));
+            }
+        }
+        "Write" => {
+            if let Some(fp) = input.get("file_path").and_then(|p| p.as_str()) {
+                details.file_paths.push((fp.to_string(), "Write".to_string()));
+            }
+        }
+        "Edit" => {
+            if let Some(fp) = input.get("file_path").and_then(|p| p.as_str()) {
+                details.file_paths.push((fp.to_string(), "Edit".to_string()));
+            }
+            let old_len = input
+                .get("old_string")
+                .and_then(|s| s.as_str())
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
+            let new_len = input
+                .get("new_string")
+                .and_then(|s| s.as_str())
+                .map(|s| s.len() as u64)
+                .unwrap_or(0);
+            if old_len > 0 || new_len > 0 {
+                details.edit_sizes.push((old_len, new_len));
+            }
+        }
+        "Grep" => {
+            if let Some(pat) = input.get("pattern").and_then(|p| p.as_str()) {
+                details.search_patterns.push(pat.to_string());
+            }
+            if let Some(fp) = input.get("path").and_then(|p| p.as_str()) {
+                details.file_paths.push((fp.to_string(), "Grep".to_string()));
+            }
+        }
+        "Glob" => {
+            if let Some(pat) = input.get("pattern").and_then(|p| p.as_str()) {
+                details.search_patterns.push(pat.to_string());
+            }
+            if let Some(fp) = input.get("path").and_then(|p| p.as_str()) {
+                details.file_paths.push((fp.to_string(), "Glob".to_string()));
+            }
+        }
+        "WebFetch" => {
+            if let Some(url) = input.get("url").and_then(|u| u.as_str()) {
+                details.urls.push(url.to_string());
+            }
+        }
+        "WebSearch" => {
+            if let Some(q) = input.get("query").and_then(|q| q.as_str()) {
+                details.web_queries.push(q.to_string());
+            }
+        }
+        "Agent" => {
+            let subagent_type = input
+                .get("subagent_type")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let description = input
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let model = input
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(String::from);
+            details.subagent_spawns.push(SubagentSpawn {
+                subagent_type,
+                description,
+                model,
+            });
+        }
+        "TodoWrite" => {
+            if let Ok(json) = serde_json::to_string(input) {
+                details.todo_snapshots.push(json);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Parse a user line — either a human prompt or a tool result.
@@ -204,6 +305,8 @@ fn parse_user_prompt(
         text_word_count,
         tool_use_ids: Vec::new(),
         is_tool_error: None,
+        tool_input_details: None,
+        tool_output_details: None,
     })
 }
 
@@ -245,6 +348,9 @@ fn parse_tool_result(
         }
     }
 
+    // Extract tool output details from toolUseResult
+    let tool_output_details = extract_tool_output(v.get("toolUseResult"));
+
     Some(MessageRecord {
         session_id,
         timestamp,
@@ -263,7 +369,64 @@ fn parse_tool_result(
         text_word_count,
         tool_use_ids,
         is_tool_error: Some(is_error),
+        tool_input_details: None,
+        tool_output_details,
     })
+}
+
+/// Extract structured data from a toolUseResult output object.
+fn extract_tool_output(tool_use_result: Option<&Value>) -> Option<ToolOutputDetails> {
+    let result = tool_use_result?;
+    let mut details = ToolOutputDetails::default();
+    let mut has_data = false;
+
+    if let Some(stdout) = result.get("stdout").and_then(|s| s.as_str()) {
+        if !stdout.is_empty() {
+            let truncated = if stdout.len() > 500 {
+                &stdout[..500]
+            } else {
+                stdout
+            };
+            details.bash_stdout = Some(truncated.to_string());
+            has_data = true;
+        }
+    }
+
+    if let Some(rc) = result.get("returnCode").and_then(|r| r.as_i64()) {
+        details.bash_return_code = Some(rc as i32);
+        has_data = true;
+    }
+
+    if let Some(t) = result.get("type").and_then(|t| t.as_str()) {
+        details.write_type = Some(t.to_string());
+        has_data = true;
+    }
+
+    // Count patch additions/deletions from structuredPatch
+    if let Some(patch) = result.get("structuredPatch") {
+        if let Some(hunks) = patch.get("hunks").and_then(|h| h.as_array()) {
+            for hunk in hunks {
+                if let Some(lines) = hunk.get("lines").and_then(|l| l.as_array()) {
+                    for line in lines {
+                        if let Some(s) = line.as_str() {
+                            if s.starts_with('+') {
+                                details.patch_additions += 1;
+                            } else if s.starts_with('-') {
+                                details.patch_deletions += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            has_data = true;
+        }
+    }
+
+    if has_data {
+        Some(details)
+    } else {
+        None
+    }
 }
 
 /// Extract total text character length and word count from content.
@@ -607,5 +770,105 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert_eq!(recs[0].session_id, "a");
         assert_eq!(recs[1].session_id, "b");
+    }
+
+    // ── Tool input extraction tests ──
+
+    #[test]
+    fn test_extract_bash_command() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Bash","id":"t1","input":{"command":"git status"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.bash_commands, vec!["git status"]);
+    }
+
+    #[test]
+    fn test_extract_read_file_path() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read","id":"t1","input":{"file_path":"/src/main.rs"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.file_paths, vec![("/src/main.rs".to_string(), "Read".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_edit_sizes() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Edit","id":"t1","input":{"file_path":"/a.rs","old_string":"hello","new_string":"hello world"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.edit_sizes, vec![(5, 11)]);
+        assert_eq!(details.file_paths[0].1, "Edit");
+    }
+
+    #[test]
+    fn test_extract_grep_pattern() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Grep","id":"t1","input":{"pattern":"fn main","path":"/src"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.search_patterns, vec!["fn main"]);
+        assert_eq!(details.file_paths, vec![("/src".to_string(), "Grep".to_string())]);
+    }
+
+    #[test]
+    fn test_extract_web_fetch_url() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebFetch","id":"t1","input":{"url":"https://example.com","prompt":"read it"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.urls, vec!["https://example.com"]);
+    }
+
+    #[test]
+    fn test_extract_web_search_query() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"t1","input":{"query":"rust async"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.web_queries, vec!["rust async"]);
+    }
+
+    #[test]
+    fn test_extract_agent_spawn() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Agent","id":"t1","input":{"subagent_type":"Explore","description":"find files","model":"haiku"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.subagent_spawns.len(), 1);
+        assert_eq!(details.subagent_spawns[0].subagent_type, "Explore");
+        assert_eq!(details.subagent_spawns[0].model, Some("haiku".to_string()));
+    }
+
+    #[test]
+    fn test_extract_multiple_tools() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"Read","id":"t1","input":{"file_path":"/a.rs"}},{"type":"tool_use","name":"Write","id":"t2","input":{"file_path":"/b.rs","content":"hello"}}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_input_details.unwrap();
+        assert_eq!(details.file_paths.len(), 2);
+        assert_eq!(details.file_paths[0], ("/a.rs".to_string(), "Read".to_string()));
+        assert_eq!(details.file_paths[1], ("/b.rs".to_string(), "Write".to_string()));
+    }
+
+    #[test]
+    fn test_no_tool_input_when_no_tools() {
+        let line = r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-03-03T10:00:00Z","cwd":"/tmp","message":{"model":"sonnet","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"hello"}],"usage":{"input_tokens":10,"output_tokens":20}}}"#;
+        let rec = parse_line(line).unwrap();
+        assert!(rec.tool_input_details.is_none());
+    }
+
+    #[test]
+    fn test_tool_output_bash_stdout() {
+        let line = r#"{"type":"user","sessionId":"s1","timestamp":"2026-03-03T10:05:00Z","cwd":"/tmp","uuid":"u1","parentUuid":"p1","toolUseResult":{"stdout":"hello world","returnCode":0},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"hello world"}]}}"#;
+        let rec = parse_line(line).unwrap();
+        let details = rec.tool_output_details.unwrap();
+        assert_eq!(details.bash_stdout, Some("hello world".to_string()));
+        assert_eq!(details.bash_return_code, Some(0));
+    }
+
+    #[test]
+    fn test_tool_output_truncates_stdout() {
+        let long_output = "x".repeat(1000);
+        let line = format!(
+            r#"{{"type":"user","sessionId":"s1","timestamp":"2026-03-03T10:05:00Z","cwd":"/tmp","uuid":"u1","parentUuid":"p1","toolUseResult":{{"stdout":"{}","returnCode":0}},"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"ok"}}]}}}}"#,
+            long_output
+        );
+        let rec = parse_line(&line).unwrap();
+        let details = rec.tool_output_details.unwrap();
+        assert_eq!(details.bash_stdout.as_ref().unwrap().len(), 500);
     }
 }

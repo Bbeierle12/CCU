@@ -7,7 +7,7 @@ use crate::config;
 use crate::parser;
 use crate::types::{MessageRecord, MessageType, MetricsState, ProjectMetrics, SessionMetrics};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// A row from the daily_metrics table.
 #[derive(Debug, Clone)]
@@ -121,6 +121,54 @@ impl Storage {
                  ALTER TABLE sessions ADD COLUMN total_idle_secs INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE sessions ADD COLUMN assistant_word_count INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE sessions ADD COLUMN user_word_count INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
+        if version < 3 {
+            self.conn.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN bash_command_counts TEXT DEFAULT '{}';
+                 ALTER TABLE sessions ADD COLUMN file_paths_touched INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN file_types TEXT DEFAULT '{}';
+                 ALTER TABLE sessions ADD COLUMN search_before_act_ratio REAL DEFAULT 0.0;
+                 ALTER TABLE sessions ADD COLUMN edit_precision_avg REAL DEFAULT 0.0;
+                 ALTER TABLE sessions ADD COLUMN exploration_breadth INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN burst_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN retry_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN phase_sequence TEXT DEFAULT '';
+                 ALTER TABLE sessions ADD COLUMN conversation_depth INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN conversation_branch_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN compaction_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN cache_efficiency REAL DEFAULT 0.0;
+                 ALTER TABLE sessions ADD COLUMN subagent_count INTEGER DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN tool_sequence_count INTEGER DEFAULT 0;
+
+                 CREATE TABLE IF NOT EXISTS daily_tool_details (
+                     date TEXT NOT NULL,
+                     tool_name TEXT NOT NULL,
+                     call_count INTEGER DEFAULT 0,
+                     error_count INTEGER DEFAULT 0,
+                     avg_latency_ms REAL DEFAULT 0.0,
+                     total_cost_estimate REAL DEFAULT 0.0,
+                     PRIMARY KEY (date, tool_name)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS daily_file_activity (
+                     date TEXT NOT NULL,
+                     file_path TEXT NOT NULL,
+                     read_count INTEGER DEFAULT 0,
+                     write_count INTEGER DEFAULT 0,
+                     edit_count INTEGER DEFAULT 0,
+                     grep_count INTEGER DEFAULT 0,
+                     PRIMARY KEY (date, file_path)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS daily_bash_commands (
+                     date TEXT NOT NULL,
+                     category TEXT NOT NULL,
+                     count INTEGER DEFAULT 0,
+                     error_count INTEGER DEFAULT 0,
+                     PRIMARY KEY (date, category)
+                 );",
             )?;
         }
 
@@ -529,6 +577,142 @@ impl Storage {
             )?;
         Ok(result)
     }
+
+    /// Persist detail tables (tool details, file activity, bash commands) for a date.
+    pub fn persist_details(&self, date: &str, state: &MetricsState) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Daily tool details
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO daily_tool_details (date, tool_name, call_count, error_count, avg_latency_ms, total_cost_estimate)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(date, tool_name) DO UPDATE SET
+                   call_count = excluded.call_count,
+                   error_count = excluded.error_count,
+                   avg_latency_ms = excluded.avg_latency_ms,
+                   total_cost_estimate = excluded.total_cost_estimate",
+            )?;
+            for (tool_name, count) in &state.tools {
+                let latency = state.tool_latencies.get(tool_name);
+                let error_count = latency.map_or(0, |l| l.error_count);
+                let avg_latency = latency.map_or(0.0, |l| l.avg_ms());
+                let cost = state.cost_intel.cost_per_tool.get(tool_name).copied().unwrap_or(0.0);
+                stmt.execute(params![date, tool_name, count, error_count, avg_latency, cost])?;
+            }
+        }
+
+        // Daily file activity
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO daily_file_activity (date, file_path, read_count, write_count, edit_count, grep_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(date, file_path) DO UPDATE SET
+                   read_count = excluded.read_count,
+                   write_count = excluded.write_count,
+                   edit_count = excluded.edit_count,
+                   grep_count = excluded.grep_count",
+            )?;
+            for (path, ft) in &state.file_intel.global_file_touches {
+                stmt.execute(params![date, path, ft.read_count, ft.write_count, ft.edit_count, ft.grep_count])?;
+            }
+        }
+
+        // Daily bash commands
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO daily_bash_commands (date, category, count, error_count)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(date, category) DO UPDATE SET
+                   count = excluded.count",
+            )?;
+            // Aggregate bash categories across all sessions
+            let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for behavior in state.session_behaviors.values() {
+                for (cat, count) in &behavior.bash_categories {
+                    *totals.entry(format!("{:?}", cat)).or_insert(0) += count;
+                }
+            }
+            for (cat, count) in &totals {
+                stmt.execute(params![date, cat, count])?;
+            }
+        }
+
+        tx.commit()
+    }
+
+    /// Query daily tool details for a date range.
+    pub fn daily_tool_details_range(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<String, Vec<(String, u64)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT date, tool_name, call_count FROM daily_tool_details
+             WHERE date >= ?1 AND date <= ?2 ORDER BY date",
+        )?;
+        let mut result: std::collections::HashMap<String, Vec<(String, u64)>> =
+            std::collections::HashMap::new();
+        let mut rows = stmt.query(params![start, end])?;
+        while let Some(row) = rows.next()? {
+            let date: String = row.get(0)?;
+            let tool: String = row.get(1)?;
+            let count: u64 = row.get(2)?;
+            result.entry(tool).or_default().push((date, count));
+        }
+        Ok(result)
+    }
+
+    /// Query top N file activity entries.
+    pub fn daily_file_activity_top(
+        &self,
+        start: &str,
+        end: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<(String, u64, u64, u64, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path, SUM(read_count), SUM(write_count), SUM(edit_count), SUM(grep_count)
+             FROM daily_file_activity
+             WHERE date >= ?1 AND date <= ?2
+             GROUP BY file_path
+             ORDER BY SUM(read_count + write_count + edit_count + grep_count) DESC
+             LIMIT ?3",
+        )?;
+        let mut result = Vec::new();
+        let mut rows = stmt.query(params![start, end, limit as u64])?;
+        while let Some(row) = rows.next()? {
+            result.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Query bash category counts for a date range.
+    pub fn daily_bash_categories_range(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> rusqlite::Result<std::collections::HashMap<String, Vec<(String, u64)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT date, category, count FROM daily_bash_commands
+             WHERE date >= ?1 AND date <= ?2 ORDER BY date",
+        )?;
+        let mut result: std::collections::HashMap<String, Vec<(String, u64)>> =
+            std::collections::HashMap::new();
+        let mut rows = stmt.query(params![start, end])?;
+        while let Some(row) = rows.next()? {
+            let date: String = row.get(0)?;
+            let category: String = row.get(1)?;
+            let count: u64 = row.get(2)?;
+            result.entry(category).or_default().push((date, count));
+        }
+        Ok(result)
+    }
 }
 
 /// Default database path.
@@ -586,6 +770,8 @@ mod tests {
             text_word_count: 0,
             tool_use_ids: vec![],
             is_tool_error: None,
+        tool_input_details: None,
+        tool_output_details: None,
         }
     }
 
@@ -615,6 +801,8 @@ mod tests {
             text_word_count: 0,
             tool_use_ids: vec![],
             is_tool_error: None,
+        tool_input_details: None,
+        tool_output_details: None,
         }
     }
 
